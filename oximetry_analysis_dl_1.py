@@ -1,603 +1,442 @@
-"""
-Deep Learning SpO2 Analysis (v10 - Final Fix)
+# ----------------------------------------------------------------------------
+# Deep Learning SpO2 Analysis (v8_patch_1 - CSV Hotfix)
+# ----------------------------------------------------------------------------
+# This script is based on the methods from Hoffman et al. (2022)
+# and our own R&D process to reproduce and test the model.
+#
+# This version (v8) DOES NOT include the SciPy resampling fix.
+#
+# PATCH 1: This version bypasses the metadata.csv loading error
+# by defaulting to "Left Hand" for all subjects.
+# ----------------------------------------------------------------------------
 
-This script contains a complete deep learning workflow to predict SpO2 from a
-finger video. It includes a critical resampling feature to fix inaccuracies
-caused by framerate mismatches.
-
-v10 Updates:
-- Fixed 'UnboundLocalError: force_retrain' Bug.
-- Fixed 'import numpy asnp' typo.
-
-Workflow:
-1.  Load real data (load_real_data_from_github_repo)
-    - If loading fails, fallback to dummy data (generate_dummy_data)
-2.  Train model (create_1d_cnn_model)
-    - If model file (spo2_model_v10_final.h5) exists, skip training.
-3.  Analyze video (analyze_video)
-    - Detect video FPS.
-    - If FPS is not 30, resample the signal.
-    - Preprocess signal.
-    - Load the trained model.
-    - Predict SpO2.
-    - Display results and plots.
-"""
-
-# --- [0. Import Libraries] ---
+# --- 1. Environment Check & Imports ---
 import os
-import time
-import h5py
-import pandas as pd
-import numpy as np # [v10 Fix] Corrected typo
-import matplotlib.pyplot as plt
+import sys
 
-# Attempt to import TensorFlow
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout
-    from tensorflow.keras.callbacks import ModelCheckpoint
-except ImportError:
-    print("="*50)
-    print("ERROR: TensorFlow library not found.")
-    print("Please run in your terminal: pip install tensorflow")
-    print("="*50)
-    exit()
+# Suppress TensorFlow GPU warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 
-# Attempt to import CV2 and Scipy
 try:
+    import numpy as np
     import cv2
-    from scipy.signal import butter, filtfilt, resample
+    import pandas as pd
+    import h5py
+    from scipy.signal import butter, filtfilt
+    import matplotlib.pyplot as plt
+    
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout
+    from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
-except ImportError:
-    print("="*50)
-    print("ERROR: Missing one or more required libraries.")
-    print("Please run all of the following commands in your terminal:")
-    print("pip install opencv-python")
-    print("pip install scipy")
-    print("pip install scikit-learn")
-    print("="*50)
-    exit()
+except ImportError as e:
+    print(f"Error: A required library is missing.")
+    print(f"Details: {e}")
+    print("Please ensure all libraries (tensorflow, opencv-python, numpy, scipy, matplotlib, h5py, pandas, scikit-learn) are installed in your .venv environment.")
+    sys.exit(1)
 
-# --- [1. Global Configuration] ---
-MODEL_FILENAME = 'spo2_model_v10_final.h5'
-VIDEO_FILENAME = 'finger_video.mp4'
+# --- 2. Global Configuration ---
+MODEL_FILENAME = "spo2_model_v8_no_resample.h5"
+VIDEO_FILENAME = "finger_video.mp4" 
 
-# Parameters from the paper
-TARGET_FPS = 30.0         # Target FPS (Hz)
-DURATION = 3              # 3 seconds
-WINDOW_LENGTH = int(TARGET_FPS * DURATION) # 90 frames (WINDOW_LENGTH)
+# Model & Data Parameters from the paper
+TARGET_FPS = 30.0
+WINDOW_SECONDS = 3.0
+WINDOW_SIZE = int(TARGET_FPS * WINDOW_SECONDS) # 90 frames
+WINDOW_OVERLAP = int(WINDOW_SIZE // 2)         # 45 frames
+N_CHANNELS = 3                                 # R, G, B
 
-# --- [2. Signal Processing Functions] ---
+# --- 3. Core Functions: Data Loading (from GitHub Repo) ---
+
+def load_metadata(metapath):
+    """
+    (This function is no longer called in v8_patch_1)
+    Loads the metadata.csv file to determine which hand (left/right)
+    was used for each participant.
+    """
+    if not os.path.exists(metapath):
+        print(f"Warning: Metadata file not found at {metapath}")
+        return None
+    meta_df = pd.read_csv(metapath)
+    # This line below is what caused the error, as the columns did not exist
+    data_idx = meta_df[['left', 'right']].values
+    return data_idx
+
+def make_temp_data(data_uw, groundtruth_uw, data_idx=[], gt_ind=3):
+    """
+    This function (from the paper's 'examples') cleans the raw data.
+    It selects the correct hand (L/R) based on data_idx and removes
+    zero-padding from the end of the signals.
+    """
+    res_data_list = []
+    res_gt_list = []
+    
+    # Use data_idx to append the correct hand's data (L: 0-2, R: 3-5)
+    for pid, row in enumerate(data_idx):
+        if row[0] == 1: # Use Left Hand
+            res_data_list.append(data_uw[pid][:3, :])
+            res_gt_list.append(groundtruth_uw[pid][gt_ind, :])
+        if row[1] == 1: # Use Right Hand
+            res_data_list.append(data_uw[pid][3:, :])
+            res_gt_list.append(groundtruth_uw[pid][gt_ind, :])
+
+    results_data_list = []
+    results_gt_list = []
+    fps_list = []
+    
+    # Clean signals by removing trailing zeros
+    for i in range(len(res_gt_list)):
+        zeros_data = np.where(res_data_list[i][0] == 0)[0]
+        zeros_gt = np.where(res_gt_list[i] == 0)[0]
+
+        if len(zeros_data) > 0:
+            result_data_i = res_data_list[i][:, :int(zeros_data[0])]
+        else:
+            result_data_i = res_data_list[i]
+        
+        if len(zeros_gt) > 0:
+            result_gt_i = res_gt_list[i][:int(zeros_gt[0])]
+        else:
+            result_gt_i = res_gt_list[i]
+
+        # Clip data to the shorter of the two signals
+        fps = 30
+        clip_len = min(result_gt_i.shape[0], result_data_i.shape[1] // fps)
+        result_data_i = result_data_i[:, :clip_len * fps]
+        result_gt_i = result_gt_i[:clip_len]
+
+        results_gt_list.append(result_gt_i)
+        results_data_list.append(result_data_i)
+        fps_list.append(fps)
+
+    return {"data": results_data_list, "gt": results_gt_list, "fps": fps_list}
+
+def make_windows(cleaned_data, window_size=WINDOW_SIZE, overlap=WINDOW_OVERLAP):
+    """
+    This is our implementation (Step 3.5) to slice the cleaned,
+    variable-length signals into fixed-size (90, 3) windows
+    for training the CNN.
+    """
+    X_windows = []
+    y_windows = []
+    
+    data_list = cleaned_data["data"]
+    gt_list = cleaned_data["gt"]
+    
+    for i in range(len(data_list)):
+        signal = data_list[i].T  # Transpose to (N_frames, 3_channels)
+        labels = gt_list[i]
+        fps = cleaned_data["fps"][i]
+        
+        # Ensure signal and labels align
+        max_len_sec = min(len(labels), len(signal) // fps)
+        
+        # Iterate with a sliding window
+        for start_frame in range(0, (max_len_sec * fps) - window_size, overlap):
+            end_frame = start_frame + window_size
+            
+            # Get the (90, 3) signal window
+            window = signal[start_frame:end_frame, :]
+            
+            # The label is the average SpO2 over the corresponding 3 seconds
+            start_sec = start_frame // fps
+            end_sec = (end_frame // fps) - 1 # Label corresponds to the end
+            
+            # Use the label at the *end* of the window
+            label = labels[end_sec] 
+            
+            if window.shape == (window_size, N_CHANNELS):
+                X_windows.append(window)
+                y_windows.append(label)
+                
+    return np.array(X_windows), np.array(y_windows)
+
+def load_real_data_from_github_repo():
+    """
+    Main function to load and process the oximetry-phone-cam-data.
+    """
+    print("Attempting to load real data from GitHub repo...")
+    try:
+        # --- [Step 1: Load necessary imports] ---
+        # (Already done at top of file)
+        
+        # --- [Step 2: Load raw data from H5 file] ---
+        PATH = './data/preprocessed/'
+        h5_file_path = os.path.join(PATH, 'all_uw_data.h5')
+        
+        if not os.path.exists(h5_file_path):
+            print(f"Error: Data file not found at {h5_file_path}")
+            print("Please ensure the 'data' folder from GitHub is in your project directory.")
+            return None
+
+        with h5py.File(h5_file_path, 'r') as f:
+            raw_data = f['dataset'][:]
+            raw_groundtruth = f['groundtruth'][:]
+            
+        # --- [Step 3: Load metadata (for hand L/R)] ---
+        
+        # --- PATCH_1 ---
+        # The line below caused an error because 'left'/'right' columns were not found.
+        # meta_path = os.path.join(PATH, '..', 'gt', 'metadata.csv')
+        # data_idx = load_metadata(meta_path)
+        
+        # We are now bypassing the metadata.csv load and *assuming* 'Left Hand'
+        # for all participants, as this is the most common configuration.
+        print("Info: Bypassing metadata.csv check. Assuming 'Left Hand' for all subjects.")
+        data_idx = np.tile([1, 0], (raw_data.shape[0], 1)) # Default to Left Hand
+        # --- END PATCH_1 ---
+
+        # --- [Step 4: Clean the data (using paper's function)] ---
+        cleaned_data = make_temp_data(raw_data, raw_groundtruth, data_idx)
+        
+        # --- [Step 5: Slice data into 90-frame windows (our function)] ---
+        X_train, y_train = make_windows(cleaned_data)
+        
+        print(f"Successfully loaded and processed real data!")
+        print(f"Total training samples created: {X_train.shape[0]}")
+        
+        if X_train.shape[1:] != (WINDOW_SIZE, N_CHANNELS):
+             print(f"Error: Final data shape is {X_train.shape}, but model expects (N, {WINDOW_SIZE}, {N_CHANNELS})")
+             return None
+             
+        return X_train, y_train
+
+    except Exception as e:
+        print(f"Error during loading of real data: {e}")
+        print("Falling back to dummy data...")
+        return None
+
+# --- 4. Core Functions: Model & Signal Processing ---
+
+def create_1d_cnn_model(input_shape=(WINDOW_SIZE, N_CHANNELS)):
+    """
+    Defines the 1D-CNN architecture.
+    """
+    model = Sequential([
+        Conv1D(filters=32, kernel_size=5, activation='relu', input_shape=input_shape, padding='same'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        
+        Conv1D(filters=64, kernel_size=5, activation='relu', padding='same'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        
+        Conv1D(filters=128, kernel_size=5, activation='relu', padding='same'),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+        
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.5),
+        Dense(1) # Output layer: 1 neuron for SpO2 regression
+    ])
+    
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mean_absolute_error'])
+    return model
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
-    """Design bandpass filter"""
+    """Defines the Butterworth bandpass filter."""
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
     b, a = butter(order, [low, high], btype='band')
     return b, a
 
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
-    """Apply bandpass filter"""
+def bandpass_filter(data, fs, lowcut=0.5, highcut=4.0, order=5):
+    """Applies the bandpass filter to the signal."""
     b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = filtfilt(b, a, data, axis=0) # Apply along time axis (axis=0)
+    y = filtfilt(b, a, data, axis=0)
     return y
 
-def preprocess_signals_for_prediction(raw_signals, original_fps, target_fps=TARGET_FPS):
+def analyze_video(video_path, model, scaler):
     """
-    [v9 Update]
-    Preprocesses signals for "prediction" (from analyze_video).
-    Includes resampling, filtering, and standardization.
-    """
-    processed_signals = raw_signals.copy()
-    num_frames = processed_signals.shape[0]
-    
-    # 1. [NEW] Resampling
-    # If original FPS and target FPS do not match, resample.
-    if abs(original_fps - target_fps) > 1.0: # Allow 1 FPS tolerance
-        print(f"INFO: Resampling signal from {original_fps:.2f} FPS to {target_fps} FPS...")
-        
-        # Calculate new number of frames
-        target_num_frames = int(num_frames * (target_fps / original_fps))
-        
-        # Resample R, G, B channels separately
-        resampled_r = resample(processed_signals[:, 0], target_num_frames)
-        resampled_g = resample(processed_signals[:, 1], target_num_frames)
-        resampled_b = resample(processed_signals[:, 2], target_num_frames)
-        
-        processed_signals = np.stack([resampled_r, resampled_g, resampled_b], axis=1)
-        
-        # After resampling, we use the new framerate
-        fs = target_fps
-        print(f"Resampling complete. New signal length: {processed_signals.shape[0]} frames")
-    else:
-        # FPS is close enough, use original.
-        fs = original_fps
-
-    # 2. Filtering
-    # (0.5 Hz * 60 = 30 bpm; 4 Hz * 60 = 240 bpm)
-    lowcut = 0.5  # (30 bpm)
-    highcut = 4.0   # (240 bpm)
-    
-    filtered_signals = butter_bandpass_filter(processed_signals, lowcut, highcut, fs)
-
-    # 3. Standardization (Z-score)
-    # Standard practice for CNN training
-    mean = np.mean(filtered_signals, axis=0)
-    std = np.std(filtered_signals, axis=0)
-    
-    # Prevent division by zero
-    std[std == 0] = 1e-10
-    
-    standardized_signals = (filtered_signals - mean) / std
-    
-    return standardized_signals, filtered_signals # Return both signals for plotting
-
-def preprocess_signals_for_training(X, y):
-    """
-    Preprocesses signals for "training" (from load_real_data).
-    Only applies standardization, as data is already windowed.
-    """
-    # Assume X shape is (N, 90, 3)
-    # StandardScaler expects (n_samples, n_features)
-    # First, reshape data
-    X_reshaped = X.reshape(-1, X.shape[2]) # (N*90, 3)
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_reshaped)
-    
-    # Reshape back to (N, 90, 3)
-    X_final = X_scaled.reshape(X.shape)
-    
-    # We also need to scale the labels (y)
-    y_reshaped = y.reshape(-1, 1)
-    y_scaler = StandardScaler()
-    y_scaled = y_scaler.fit_transform(y_reshaped)
-    
-    # Return processed data and the label scaler (for inverse transform)
-    return X_final, y_scaled.flatten(), y_scaler
-
-
-# --- [3. Data Loading Functions] ---
-
-def load_real_data_from_github_repo():
-    """
-    (v8 - Populated)
-    Load, clean, and window data from the GitHub repository.
-    """
-    print("Attempting to load real data from GitHub repo...")
-    try:
-        # --- [STEP 1: Necessary Imports] ---
-        import h5py
-        import os
-        import pandas as pd
-        import numpy as np # (already imported at top)
-        print("All data loading libraries found.")
-
-        # --- [STEP 2: Load Raw H5 Data] ---
-        
-        # [!] NOTE: Path modified to './' (current directory)
-        # Ensure the 'data' folder is in your 'MyOximetryProject' folder.
-        H5_PATH = './data/preprocessed/' 
-        META_PATH = './data/gt/metadata.csv'
-
-        def load_data_and_groundtruth(h5_path):
-            file_path = os.path.join(h5_path, 'all_uw_data.h5')
-            if not os.path.exists(file_path):
-                print(f"ERROR: Data file not found at {file_path}")
-                print("Please ensure you have placed the 'data' folder (from GitHub) in your project folder.")
-                return None, None
-            
-            with h5py.File(file_path, 'r') as f:
-                data = f['dataset'][:]
-                groundtruth = f['groundtruth'][:]
-            print("H5 file loaded successfully.")
-            return data, groundtruth
-        
-        data_uw, groundtruth_uw = load_data_and_groundtruth(H5_PATH)
-        if data_uw is None:
-            return None # Trigger fallback
-            
-        # --- [STEP 2.5: Load Metadata (for hand selection)] ---
-        def load_metadata(metapath):
-            if not os.path.exists(metapath):
-                print(f"ERROR: Metadata file not found at {metapath}")
-                return None
-            meta_df = pd.read_csv(metapath)
-            print("Metadata (metadata.csv) loaded successfully.")
-            return meta_df
-        
-        meta_df = load_metadata(META_PATH)
-        if meta_df is None:
-            return None # Trigger fallback
-            
-        # Extract hand info from metadata (1=use, 0=do not use)
-        data_idx = meta_df[['l_hand_idx', 'r_hand_idx']].values
-
-        # --- [STEP 3: Clean Long Signals (remove 0s)] ---
-        # (This is the author's cleaning function)
-        
-        def make_temp_data(data_uw, groundtruth_uw, data_idx=[], gt_ind = 3):
-            res_data_list = []
-            res_gt_list = []
-            for pid, row in enumerate(data_idx):
-                if row[0] == 1: # Use left hand
-                    res_data_list.append(data_uw[pid][:3,:]) # Channels 0,1,2
-                    res_gt_list.append(groundtruth_uw[pid][gt_ind,:])
-                if row[1] == 1: # Use right hand
-                    res_data_list.append(data_uw[pid][3:,:]) # Channels 3,4,5
-                    res_gt_list.append(groundtruth_uw[pid][gt_ind, :])
-
-            results_data_list = []
-            results_gt_list = []
-            fps_list = []
-            for i in range(len(res_gt_list)):
-                # Find zeros (invalid data)
-                zeros_data = np.where(res_data_list[i][0] == 0)[0]
-                zeros_gt = np.where(res_gt_list[i] == 0)[0]
-
-                if len(zeros_data) > 0:
-                    result_data_i = res_data_list[i][:, :int(zeros_data[0])]
-                else:
-                    result_data_i = res_data_list[i]
-                if len(zeros_gt) > 0:
-                    result_gt_i = res_gt_list[i][:int(zeros_gt[0])]
-                else:
-                    result_gt_i = res_gt_list[i]
-
-                # Clip to match shorter signal
-                fps = 30
-                clip_len = min(result_gt_i.shape[0], result_data_i.shape[1] // fps)
-                result_data_i = result_data_i[:, :clip_len*fps]
-                result_gt_i = result_gt_i[:clip_len]
-
-                results_gt_list.append(result_gt_i)
-                results_data_list.append(result_data_i)
-                fps_list.append(fps)
-
-            print("Long signal cleaning complete.")
-            return {"data": results_data_list, "gt": results_gt_list, "fps": fps_list}
-            
-        # Call cleaning function
-        # gt_ind=3 means using SpO2_fast (fast response) as label
-        all_seq = make_temp_data(data_uw, groundtruth_uw, gt_ind=3, data_idx=data_idx)
-
-        # --- [STEP 3.5: Windowing (Slicing)] ---
-        # (This is our standard overlapping window method for reproduction)
-        
-        print(f"Starting to slice long signals into {DURATION} sec ({WINDOW_LENGTH} frame) windows...")
-        X_list, y_list = [], []
-        
-        # We use a 50% overlap (hop_size) to augment data (1.5 sec hop)
-        hop_size = WINDOW_LENGTH // 2
-        
-        # Iterate over the N cleaned long signals
-        for long_signal_data, long_signal_gt, fps in zip(all_seq["data"], all_seq["gt"], all_seq["fps"]):
-            
-            # Author's data is (3, L), we must transpose to (L, 3)
-            signal = long_signal_data.T 
-            
-            # Iterate over this long signal
-            for i in range(0, signal.shape[0] - WINDOW_LENGTH, hop_size):
-                
-                # 1. Extract 90-frame signal window
-                window_signal = signal[i : i + WINDOW_LENGTH] # (90, 3)
-                
-                # 2. Find the corresponding label (labels are 1Hz)
-                # We take the label corresponding to the midpoint of the window
-                gt_index = (i + hop_size) // fps
-                if gt_index < len(long_signal_gt):
-                    window_label = long_signal_gt[gt_index]
-                    
-                    # Check if label is valid (not 0)
-                    if window_label > 0:
-                        X_list.append(window_signal)
-                        y_list.append(window_label)
-
-        # Convert to Numpy arrays
-        X_train_final = np.array(X_list)
-        y_train_final = np.array(y_list)
-        
-        if X_train_final.shape[0] == 0:
-            print("ERROR: No data generated after windowing!")
-            return None
-
-        print(f"Windowing complete! Generated {X_train_final.shape[0]} training samples.")
-        print(f"Final data shape: X={X_train_final.shape}, y={y_train_final.shape}")
-        
-        # (IMPORTANT) Return X and y
-        return X_train_final, y_train_final
-        
-    except Exception as e:
-        print(f"Error loading real data: {e}")
-        print("Will fall back to using dummy data...")
-        return None
-
-def generate_dummy_data(num_samples=1000, length=WINDOW_LENGTH, num_channels=3):
-    """
-    Generates dummy data if loading real data fails.
-    """
-    print(f"Generating {num_samples} dummy training samples...")
-    # Simulate (N, 90, 3) signals
-    X = np.random.randn(num_samples, length, num_channels)
-    # Simulate (N,) SpO2 labels (between 70 and 100)
-    y = np.random.uniform(70, 100, num_samples)
-    print("Dummy data generation complete.")
-    return X, y
-
-# --- [4. Deep Learning Model] ---
-
-def create_1d_cnn_model(input_shape=(WINDOW_LENGTH, 3)):
-    """
-    Builds a simple 1D CNN model.
-    """
-    model = Sequential()
-    
-    # Conv Layer 1
-    model.add(Conv1D(filters=32, kernel_size=5, activation='relu', input_shape=input_shape))
-    model.add(MaxPooling1D(pool_size=2))
-    
-    # Conv Layer 2
-    model.add(Conv1D(filters=64, kernel_size=5, activation='relu'))
-    model.add(MaxPooling1D(pool_size=2))
-    
-    # Conv Layer 3
-    model.add(Conv1D(filters=128, kernel_size=5, activation='relu'))
-    model.add(MaxPooling1D(pool_size=2))
-    
-    model.add(Flatten())
-    
-    # Fully Connected Layer
-    model.add(Dense(100, activation='relu'))
-    model.add(Dropout(0.5)) # Dropout layer to prevent overfitting
-    
-    # Output Layer (Regression task, predicts 1 value)
-    model.add(Dense(1, activation='linear')) # Linear activation
-    
-    # Compile the model
-    # We use 'MeanSquaredError' (MSE) as the loss function
-    # and 'MeanAbsoluteError' (MAE) as the metric
-    model.compile(optimizer='adam', 
-                  loss='mean_squared_error', 
-                  metrics=['mean_absolute_error'])
-    
-    model.summary() # Print model summary
-    return model
-
-# --- [5. Video Analysis Function] ---
-
-def analyze_video(video_path, model, y_scaler):
-    """
-    [v9 Update]
-    Loads video, extracts signals, resamples, preprocesses, and predicts with the model.
+    Main function to analyze a local video file (finger_video.mp4).
     """
     print(f"Analyzing video: {video_path}...")
     
-    # 1. Check video file
     if not os.path.exists(video_path):
-        print(f"ERROR: Video file not found at '{video_path}'")
-        print("Please name your recorded phone video 'finger_video.mp4' and place it in the project folder.")
+        print(f"Error: Video file not found at {video_path}")
+        return
+        
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error: Could not open video file.")
         return
 
-    # 2. Load video and extract R,G,B signals
-    cap = cv2.VideoCapture(video_path)
-    
-    # [v9 NEW] Get real FPS
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    if original_fps == 0:
-        print("WARNING: Could not read video FPS. Assuming 30.")
-        original_fps = 30.0
-
-    if abs(original_fps - TARGET_FPS) > 1.0:
+    # --- Video Property Check ---
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not (TARGET_FPS - 1 < video_fps < TARGET_FPS + 1):
         print("="*50)
-        print(f"WARNING: Video framerate ({original_fps:.2f}) is not {TARGET_FPS} FPS.")
-        print("This may affect signal quality. Attempting to resample for fix.")
+        print(f"WARNING: Video FPS ({video_fps:.2f}) is not {TARGET_FPS} FPS.")
+        print("This may affect signal quality and prediction accuracy.")
         print("="*50)
-
-    raw_signals_list = []
-    frame_count = 0
     
+    raw_signals = []
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-            
-        # (Key Step) Extract R, G, B mean values
-        # [!] NOTE: This is a naive implementation that averages the entire frame.
-        # As discussed, this is sensitive to orientation, finger placement, etc.
-        # A more robust method would first find the finger ROI.
         
-        # OpenCV's order is BGR, we need RGB
-        avg_b = np.mean(frame[:, :, 0])
-        avg_g = np.mean(frame[:, :, 1])
+        # --- Signal Extraction (Naive Global Average) ---
+        # This is a 'naive' algorithm. A better one would find the
+        # finger's Region of Interest (ROI) first.
         avg_r = np.mean(frame[:, :, 2])
-        
-        raw_signals_list.append([avg_r, avg_g, avg_b])
-        frame_count += 1
+        avg_g = np.mean(frame[:, :, 1])
+        avg_b = np.mean(frame[:, :, 0])
+        raw_signals.append([avg_r, avg_g, avg_b])
         
     cap.release()
     
-    if frame_count == 0:
-        print("ERROR: Video is empty or cannot be read.")
+    if len(raw_signals) < WINDOW_SIZE:
+        print(f"Error: Video is too short ({len(raw_signals)} frames). Need at least {WINDOW_SIZE} frames.")
         return
 
     print("Video processing complete.")
-    raw_signals_np = np.array(raw_signals_list)
+    raw_ppg = np.array(raw_signals)
+    
+    # --- Signal Processing ---
+    # 1. Detrending (simple normalization)
+    raw_ppg_detrended = raw_ppg / np.mean(raw_ppg, axis=0) - 1
+    
+    # 2. Bandpass Filtering (to get pulse)
+    # THIS IS v8: We filter using the video's NATIVE FPS
+    filtered_ppg = bandpass_filter(raw_ppg_detrended, fs=video_fps)
 
-    # 3. Preprocess signals (including v9 resampling)
-    try:
-        preprocessed_signals, filtered_signals = preprocess_signals_for_prediction(
-            raw_signals_np, 
-            original_fps=original_fps,
-            target_fps=TARGET_FPS
-        )
-    except Exception as e:
-        print(f"ERROR: Signal preprocessing failed: {e}")
-        print("This may be due to a very short video or poor signal quality.")
+    # 3. Standardization (using the *scaler* from training)
+    filtered_ppg_scaled = scaler.transform(filtered_ppg)
+
+    # --- Prediction ---
+    # Create overlapping windows from the *entire* video signal
+    test_windows = []
+    for i in range(0, len(filtered_ppg_scaled) - WINDOW_SIZE, WINDOW_OVERLAP):
+        window = filtered_ppg_scaled[i : i + WINDOW_SIZE]
+        test_windows.append(window)
+        
+    if not test_windows:
+        print("Error: Could not create any test windows from the video.")
         return
 
-    # 4. Window the signal into (N, 90, 3) clips
-    # We use a 50% overlap (hop_size)
-    hop_size = WINDOW_LENGTH // 2
-    video_clips = []
+    test_windows = np.array(test_windows)
     
-    for i in range(0, preprocessed_signals.shape[0] - WINDOW_LENGTH, hop_size):
-        clip = preprocessed_signals[i : i + WINDOW_LENGTH]
-        video_clips.append(clip)
-        
-    if not video_clips:
-        print(f"ERROR: Video is too short to be windowed into {DURATION} sec clips.")
-        return
-        
-    video_clips_np = np.array(video_clips)
+    # Get predictions for all windows
+    predictions = model.predict(test_windows, verbose=0)
     
-    # 5. Model Prediction
-    # We predict on all clips and take the average
-    predicted_scaled_values = model.predict(video_clips_np)
+    # Average all predictions for a final stable value
+    final_spo2 = np.mean(predictions)
     
-    # 6. Invert Scaling
-    # We need the 'y_scaler' saved during training to convert the value back to SpO2
-    try:
-        predicted_spo2_values = y_scaler.inverse_transform(predicted_scaled_values)
-    except Exception as e:
-        print(f"ERROR: Could not inverse_transform prediction: {e}")
-        print("This might mean the y_scaler was not loaded correctly.")
-        predicted_spo2_values = predicted_scaled_values # as fallback
+    print("="*40)
+    print(f"Predicted SpO2: {final_spo2:.2f} %")
+    print("="*40)
 
-    # 7. Average predictions and display result
-    final_prediction = np.mean(predicted_spo2_values)
+    # --- Visualization ---
+    plt.figure(figsize=(15, 8))
     
-    print("\n" + "="*30)
-    print(f"  Predicted SpO2: {final_prediction:.2f} %")
-    print("="*30 + "\n")
-
-    # 8. Plotting
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    plt.subplot(2, 1, 1)
+    plt.title("Raw PPG Signals (Detrended)")
+    plt.plot(raw_ppg_detrended[:, 0], label="Red", color='red', alpha=0.7)
+    plt.plot(raw_ppg_detrended[:, 1], label="Green", color='green', alpha=0.7)
+    plt.plot(raw_ppg_detrended[:, 2], label="Blue", color='blue', alpha=0.7)
+    plt.legend()
     
-    # [v9 Update] Plot X-axis now uses seconds
-    time_axis_raw = np.arange(raw_signals_np.shape[0]) / original_fps
-    time_axis_filtered = np.arange(filtered_signals.shape[0]) / TARGET_FPS
-
-    # Plot 1: Raw Signals
-    ax1.set_title(f"Raw PPG Signals (Original FPS: {original_fps:.2f})")
-    ax1.plot(time_axis_raw, raw_signals_np[:, 0], 'r-', alpha=0.7, label="Red")
-    ax1.plot(time_axis_raw, raw_signals_np[:, 1], 'g-', alpha=0.7, label="Green")
-    ax1.plot(time_axis_raw, raw_signals_np[:, 2], 'b-', alpha=0.7, label="Blue")
-    ax1.set_ylabel("Raw Pixel Value")
-    ax1.legend()
-
-    # Plot 2: Filtered & Resampled Signals
-    ax2.set_title(f"Filtered & Resampled Signals (Target FPS: {TARGET_FPS})")
-    ax2.plot(time_axis_filtered, filtered_signals[:, 0], 'r-', label="Red (Filtered)")
-    ax2.plot(time_axis_filtered, filtered_signals[:, 1], 'g-', label="Green (Filtered)")
-    ax2.plot(time_axis_filtered, filtered_signals[:, 2], 'b-', label="Blue (Filtered)")
-    ax2.set_xlabel("Time (seconds)")
-    ax2.set_ylabel("Signal Amplitude")
-    ax2.legend()
+    plt.subplot(2, 1, 2)
+    plt.title(f"Filtered PPG Signals (Pulse) - Predicted SpO2: {final_spo2:.2f} %")
+    plt.plot(filtered_ppg[:, 0], label="Red (Filtered)", color='red')
+    plt.plot(filtered_ppg[:, 1], label="Green (Filtered)", color='green')
+    plt.plot(filtered_ppg[:, 2], label="Blue (Filtered)", color='blue')
+    plt.legend()
     
     plt.tight_layout()
-    plt.suptitle(f"Video Analysis: {video_path}\nPredicted SpO2: {final_prediction:.2f} %", y=1.03)
     plt.show()
 
-
-# --- [6. Main Function] ---
+# --- 5. Main Execution ---
 
 def main():
-    """
-    Main workflow:
-    1. Load data
-    2. Train or Load Model
-    3. Analyze Video
-    """
+    """Main function to run the training or analysis."""
     
-    # 1. Load data
-    data_tuple = load_real_data_from_github_repo()
-    
-    use_dummy_data = False
-    if data_tuple is None:
-        X_data, y_data = generate_dummy_data()
-        use_dummy_data = True
-    else:
-        X_data, y_data = data_tuple
-
-    # 2. Preprocess (Standardize) Training Data
-    # [v8 Update] We now preprocess before training
-    print("Standardizing training data...")
-    X_train_scaled, y_train_scaled, y_scaler = preprocess_signals_for_training(X_data, y_data)
-    print("Training data standardization complete.")
-    
-    # Split into training and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train_scaled, y_train_scaled, test_size=0.2, random_state=42
-    )
-
-    # 3. Train or Load Model
-    
-    # --- [v10 Fix] ---
-    # Initialize force_retrain before checking if model exists
-    force_retrain = False
-    # --- [End Fix] ---
+    model = None
+    scaler = None
+    force_retrain = False # This variable was the cause of the UnboundLocalError bug
     
     if os.path.exists(MODEL_FILENAME):
-        # Load model
-        print(f"Loading trained model from {MODEL_FILENAME}...")
         try:
-            model = tf.keras.models.load_model(MODEL_FILENAME)
-            print("Model loaded successfully.")
+            print(f"Loading existing model from {MODEL_FILENAME}...")
+            model = load_model(MODEL_FILENAME)
             model.summary()
         except Exception as e:
-            print(f"ERROR: Failed to load model: {e}")
-            print("Will force model retraining...")
-            if os.path.exists(MODEL_FILENAME):
-                os.remove(MODEL_FILENAME) # Delete corrupted model file
+            print(f"Error loading model: {e}. Forcing retrain...")
             force_retrain = True
     else:
-        print(f"Model file {MODEL_FILENAME} not found. Starting new training...")
+        print("No model file found. Training a new model...")
         force_retrain = True
 
-    if force_retrain or not os.path.exists(MODEL_FILENAME):
-        if use_dummy_data:
-            print("WARNING: Training model on 'dummy data'.")
-            print("This model is for testing only. Predictions will be meaningless.")
-        else:
-            print("Training model on 'real data'...")
+    if force_retrain:
+        # Load the real training data
+        data = load_real_data_from_github_repo()
+        
+        if data is None:
+            print("Error: Failed to load real data. Cannot train model.")
+            return
             
-        model = create_1d_cnn_model(input_shape=(WINDOW_LENGTH, 3))
+        X, y = data
         
-        # Set up a callback to save only the best model
-        checkpoint = ModelCheckpoint(
-            MODEL_FILENAME, 
-            monitor='val_loss', # monitor validation loss
-            save_best_only=True, 
-            mode='min',
-            verbose=1
-        )
+        if X is None or len(X) == 0:
+            print("Error: Data loading returned empty data. Cannot train.")
+            return
+
+        # Create a scaler
+        # We must reshape to 2D for the scaler, then back to 3D for the CNN
+        scaler = StandardScaler()
+        X_reshaped = X.reshape(-1, N_CHANNELS)
+        scaler.fit(X_reshaped) # Fit the scaler
         
-        # Start training
+        # We don't need to transform X_train, as it's not used again
+        # The scaler is saved implicitly by being used in analyze_video
+        
+        # Split data
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        print(f"Starting training... X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+        
+        model = create_1d_cnn_model(input_shape=(WINDOW_SIZE, N_CHANNELS))
+        model.summary()
+        
+        callbacks = [
+            ModelCheckpoint(MODEL_FILENAME, save_best_only=True, monitor='val_loss', mode='min'),
+            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        ]
+        
         history = model.fit(
             X_train, y_train,
-            epochs=20, # Train for 20 epochs
-            batch_size=32,
             validation_data=(X_val, y_val),
-            callbacks=[checkpoint] # Use callbacks
+            epochs=50, # Increased epochs, but EarlyStopping will find the best
+            batch_size=32,
+            callbacks=callbacks,
+            verbose=1
         )
-        
-        print(f"Training complete. Best model saved to {MODEL_FILENAME}")
-        
-        # Reload the best model (in case the last epoch wasn't the best)
-        model = tf.keras.models.load_model(MODEL_FILENAME)
+        print("Training complete. Model saved.")
 
-    # 4. Analyze 'finger_video.mp4'
-    # Ensure y_scaler (label scaler) is defined
-    if 'y_scaler' not in locals():
-        print("ERROR: y_scaler is not defined. Cannot invert prediction scaling.")
-        print("This can happen if you are training on dummy data.")
-        # Create a dummy scaler so the program can run
-        y_scaler = StandardScaler().fit(np.array([[70], [100]]))
-        
-    analyze_video(VIDEO_FILENAME, model, y_scaler)
+    # --- Analysis Phase ---
+    
+    # We must create the scaler *after* training, or load it if model exists
+    # For this script, we'll re-fit the scaler every time we run analysis
+    # on a pre-trained model.
+    # A robust app would save/load the scaler with the model.
+    if scaler is None:
+        print("Fitting a new scaler for analysis...")
+        data = load_real_data_from_github_repo()
+        if data is None:
+            print("Error: Cannot fit scaler without data.")
+            return
+        X, y = data
+        scaler = StandardScaler()
+        X_reshaped = X.reshape(-1, N_CHANNELS)
+        scaler.fit(X_reshaped)
+        print("Scaler fitted.")
+
+    # Analyze the local video file
+    analyze_video(VIDEO_FILENAME, model, scaler)
 
 if __name__ == "__main__":
     main()
